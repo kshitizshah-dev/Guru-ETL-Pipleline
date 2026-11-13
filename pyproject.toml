@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ekal-excel-pipeline"
+version = "0.2.0"
+description = "Excel-to-hosted-PostgreSQL ETL for Ekal analytics (Superset reads the database)"
+requires-python = ">=3.11"
+dependencies = [
+  "pandas>=2.2,<3",
+  "openpyxl>=3.1,<4",
+  "SQLAlchemy>=2,<3",
+  "psycopg2-binary>=2.9,<3",
+  "python-dotenv>=1,<2",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
