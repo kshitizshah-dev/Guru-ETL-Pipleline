@@ -271,10 +271,18 @@ def _normalize_value(val: Any) -> Any:
         return None
     if isinstance(val, float) and pd.isna(val):
         return None
-    if isinstance(val, pd.Timestamp):
-        if pd.isna(val):
+    if isinstance(val, datetime):
+        # pd.Timestamp (Excel side) and datetime (database side) must produce the
+        # same text, otherwise every row looks "changed". NaT is not a datetime
+        # instance check-safe, so test it first.
+        ts = pd.Timestamp(val)
+        if pd.isna(ts):
             return None
-        return val.isoformat()
+        if ts.tzinfo is not None:
+            ts = ts.tz_convert("UTC").tz_localize(None)
+        return ts.isoformat()
+    if val is pd.NaT:
+        return None
     if hasattr(val, "item"):
         # numpy scalar → python scalar
         return val.item()
@@ -376,9 +384,9 @@ def upsert_ekal(
             for row in result.mappings():
                 existing_rows[row["id"]] = dict(row)
 
-        # Process each incoming row
-        for _, row_series in frame.iterrows():
-            row_dict = row_series.to_dict()
+        # Decide row by row (in memory, no database calls) what to write.
+        to_write: List[Dict[str, Any]] = []
+        for row_dict in frame.to_dict("records"):
             row_id = row_dict["id"]
 
             if row_id in existing_rows:
@@ -400,40 +408,14 @@ def upsert_ekal(
                     )
                     unchanged += 1
                     continue
-
-                # UPDATE the changed row
-                set_clauses = ", ".join(
-                    f'"{c}" = :val_{c}' for c in non_id_columns
-                )
-                set_clauses += f', "{META_IMPORT_TS}" = :meta_ts'
-                params = {f"val_{c}": _convert_for_pg(row_dict.get(c)) for c in non_id_columns}
-                params["meta_ts"] = import_ts
-                params["row_id"] = row_id
-                conn.execute(
-                    text(
-                        f'UPDATE public."{table_name}" '
-                        f'SET {set_clauses} '
-                        f'WHERE "id" = :row_id'
-                    ),
-                    params,
-                )
                 updated += 1
             else:
-                # INSERT new row
-                col_names = ", ".join(f'"{c}"' for c in data_columns)
-                col_names += f', "{META_IMPORT_TS}"'
-                placeholders = ", ".join(f":val_{c}" for c in data_columns)
-                placeholders += ", :meta_ts"
-                params = {f"val_{c}": _convert_for_pg(row_dict.get(c)) for c in data_columns}
-                params["meta_ts"] = import_ts
-                conn.execute(
-                    text(
-                        f'INSERT INTO public."{table_name}" ({col_names}) '
-                        f'VALUES ({placeholders})'
-                    ),
-                    params,
-                )
                 inserted += 1
+            to_write.append(row_dict)
+
+        # Send all inserts + updates in a few large statements instead of one
+        # network round trip per row (this is what made uploads slow).
+        _write_rows(conn, table_name, data_columns, non_id_columns, to_write, import_ts)
 
     total = inserted + updated + unchanged + rejected
     logger.info(
@@ -447,6 +429,50 @@ def upsert_ekal(
         "rejected": rejected,
         "total": total,
     }
+
+
+WRITE_MAX_ROWS = 1000        # rows per statement
+WRITE_MAX_PARAMS = 30000     # stays under SQLite's variable limit as well
+
+
+def _write_rows(
+    conn,
+    table_name: str,
+    data_columns: List[str],
+    non_id_columns: List[str],
+    rows: List[Dict[str, Any]],
+    import_ts: datetime,
+) -> None:
+    """Insert new rows and update changed rows with multi-row
+    ``INSERT ... ON CONFLICT (id) DO UPDATE`` statements."""
+    if not rows:
+        return
+    all_cols = list(data_columns) + [META_IMPORT_TS]
+    col_list = ", ".join(f'"{c}"' for c in all_cols)
+    update_set = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in non_id_columns + [META_IMPORT_TS])
+    per_statement = max(1, min(WRITE_MAX_ROWS, WRITE_MAX_PARAMS // len(all_cols)))
+
+    for start in range(0, len(rows), per_statement):
+        chunk = rows[start : start + per_statement]
+        params: Dict[str, Any] = {}
+        value_groups = []
+        for r, row in enumerate(chunk):
+            names = []
+            for c, col in enumerate(data_columns):
+                key = f"p{r}_{c}"
+                params[key] = _convert_for_pg(row.get(col))
+                names.append(f":{key}")
+            params[f"p{r}_ts"] = import_ts
+            names.append(f":p{r}_ts")
+            value_groups.append("(" + ", ".join(names) + ")")
+        conn.execute(
+            text(
+                f'INSERT INTO public."{table_name}" ({col_list}) '
+                f'VALUES {", ".join(value_groups)} '
+                f'ON CONFLICT ("id") DO UPDATE SET {update_set}'
+            ),
+            params,
+        )
 
 
 def _convert_for_pg(val: Any) -> Any:

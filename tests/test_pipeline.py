@@ -708,3 +708,53 @@ def test_row_values_equal():
         {"name": None, "score": None},
         cols,
     )
+
+
+# ---------------------------------------------------------------------------
+# Regression: datetime comparison and batched writes
+# ---------------------------------------------------------------------------
+
+def test_datetime_from_excel_and_database_compare_equal():
+    from datetime import datetime as _dt
+    from ekal_pipeline.pipeline import _row_values_equal
+    incoming = {"date_time": pd.Timestamp("2026-11-15 10:00:00"), "seconds": 5}
+    existing = {"date_time": _dt(2026, 11, 15, 10, 0, 0), "seconds": 5}
+    assert _row_values_equal(incoming, existing, ["date_time", "seconds"])
+
+
+def test_reimport_reports_unchanged_and_batches_large_frames(tmp_path):
+    from ekal_pipeline import pipeline as p
+    from sqlalchemy import event
+    import sqlite3
+    sqlite3.register_converter("TIMESTAMP", lambda b: datetime.fromisoformat(b.decode()))
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'main.db'}",
+        connect_args={"detect_types": sqlite3.PARSE_DECLTYPES},   # PG returns datetimes
+    )
+
+    @event.listens_for(engine, "connect")
+    def _attach_public(dbapi_conn, _):   # the real code writes to schema "public"
+        dbapi_conn.execute(f"ATTACH DATABASE '{tmp_path / 'public.db'}' AS public")
+
+    with engine.begin() as conn:
+        conn.execute(text(
+            'CREATE TABLE public.ekal (id TEXT PRIMARY KEY, date_time TIMESTAMP, '
+            'teacher TEXT, seconds DOUBLE PRECISION, _last_import_ts TIMESTAMP)'
+        ))
+    n = 2500  # more than one write batch
+    frame = pd.DataFrame({
+        "id": pd.array([f"id{i}" for i in range(n)], dtype="string"),
+        "date_time": pd.to_datetime(["2026-11-15 10:00:00"] * n),
+        "teacher": ["t"] * n,
+        "seconds": [5.0] * n,
+    })
+    first = p.upsert_ekal(frame, engine, datetime(2026, 11, 20, tzinfo=timezone.utc))
+    assert first["inserted"] == n
+    again = p.upsert_ekal(frame, engine, datetime(2026, 11, 21, tzinfo=timezone.utc))
+    assert again["unchanged"] == n and again["updated"] == 0
+
+    frame.loc[0, "seconds"] = 99.0
+    third = p.upsert_ekal(frame, engine, datetime(2026, 11, 22, tzinfo=timezone.utc))
+    assert third["updated"] == 1 and third["unchanged"] == n - 1
+    with engine.connect() as conn:
+        assert conn.execute(text('SELECT seconds FROM ekal WHERE id = \'id0\'')).scalar() == 99

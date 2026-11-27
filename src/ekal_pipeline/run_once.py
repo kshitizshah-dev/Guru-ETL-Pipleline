@@ -96,10 +96,17 @@ def sort_files_by_export_date(paths: list[Path]) -> list[Path]:
 
 
 def candidate_files() -> list[Path]:
-    return [
-        p for p in WATCH_DIR.glob("*.xlsx")
-        if p.is_file() and not p.name.startswith("~$")   # skip Excel's temp lock files
-    ]
+    """Only the ``*_Ekal.xlsx`` exports are imported. The original Firestore
+    workbooks (no Ekal sheet) sit in the same folder and are left untouched."""
+    found = []
+    for p in WATCH_DIR.glob("*.xlsx"):
+        if not p.is_file() or p.name.startswith("~$"):   # skip Excel's temp lock files
+            continue
+        if not p.stem.lower().endswith("_ekal"):
+            logger.info("Skipping non-Ekal workbook: %s", p.name)
+            continue
+        found.append(p)
+    return found
 
 
 def is_ready(path: Path) -> bool:

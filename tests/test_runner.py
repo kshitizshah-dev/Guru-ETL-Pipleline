@@ -95,10 +95,11 @@ def test_sort_oldest_export_first(tmp_path):
 
 
 def test_candidate_files_skips_excel_lock_files(env):
-    make(env["watch"], "good.xlsx")
-    make(env["watch"], "~$good.xlsx")
+    make(env["watch"], "good_Ekal.xlsx")
+    make(env["watch"], "~$good_Ekal.xlsx")
+    make(env["watch"], "F_29-10-2026-06.55.xlsx")   # original Firestore export: ignored
     make(env["watch"], "notes.txt")
-    assert [p.name for p in run_once.candidate_files()] == ["good.xlsx"]
+    assert [p.name for p in run_once.candidate_files()] == ["good_Ekal.xlsx"]
 
 
 @pytest.mark.parametrize("given,expected_prefix", [
